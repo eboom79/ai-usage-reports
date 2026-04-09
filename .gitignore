@@ -1,0 +1,13 @@
+# Sensitive credentials — never commit these
+.env
+*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Desktop shortcut
+*.desktop
