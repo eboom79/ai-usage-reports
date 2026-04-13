@@ -18,14 +18,53 @@ Usage (standalone test)
 import asyncio
 import logging
 import os
+import platform
+import shutil
 import subprocess
 import sys
+from typing import Optional
 
 log = logging.getLogger(__name__)
 
+def _default_chrome_bin() -> str:
+    env_bin = os.getenv("CHROME_BIN")
+    if env_bin:
+        return env_bin
+
+    candidates = []
+    if platform.system() == "Darwin":
+        candidates.extend([
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            str(os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")),
+        ])
+    else:
+        candidates.extend([
+            "/opt/google/chrome/chrome",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium",
+        ])
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+
+    return shutil.which("google-chrome") or shutil.which("chromium") or candidates[0]
+
+
+def _default_chrome_user_data() -> str:
+    env_dir = os.getenv("CHROME_USER_DATA")
+    if env_dir:
+        return env_dir
+
+    home = os.path.expanduser("~")
+    if platform.system() == "Darwin":
+        return os.path.join(home, "Library", "Application Support", "AI Usage Chrome Debug")
+    return "/tmp/chrome-debug-hex"
+
+
 CHROME_DEBUG_PORT = int(os.getenv("CHROME_DEBUG_PORT", "9222"))
-CHROME_BIN        = os.getenv("CHROME_BIN", "/opt/google/chrome/chrome")
-CHROME_USER_DATA  = os.getenv("CHROME_USER_DATA", "/tmp/chrome-debug-hex")
+CHROME_BIN        = _default_chrome_bin()
+CHROME_USER_DATA  = _default_chrome_user_data()
 # Extra seconds to wait after page load so Hex JS charts finish rendering
 RENDER_WAIT_MS = int(os.getenv("HEX_RENDER_WAIT_MS", "6000"))
 
@@ -49,15 +88,28 @@ def launch_chrome_to_login(port: int = CHROME_DEBUG_PORT) -> None:
         f"--user-data-dir={CHROME_USER_DATA}",
         "--no-first-run",
         "--no-default-browser-check",
-        "--window-position=0,-10000",   # off-screen: invisible, no focus steal
         HEX_LOGIN_URL,
     ]
+    if platform.system() != "Darwin":
+        cmd.insert(-1, "--window-position=0,-10000")   # off-screen on Linux
     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     log.info("Launched Chrome off-screen on port %d", port)
 
 
 def _focus_chrome_window() -> None:
     """Move Chrome back on-screen and raise it so the user can log in."""
+    if platform.system() == "Darwin":
+        for script in (
+            'tell application "Google Chrome" to activate',
+            'tell application "Google Chrome" to reopen',
+        ):
+            try:
+                subprocess.run(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except FileNotFoundError:
+                break
+        log.info("Chrome activated for login on macOS")
+        return
+
     # Move to a visible position first, then activate
     for cmd in (
         ["wmctrl", "-r", "Google Chrome", "-e", "0,100,100,1280,800"],
@@ -88,7 +140,6 @@ async def _extract_cookies_async(port: int) -> list:
         cdp_context = cdp_browser.contexts[0] if cdp_browser.contexts else None
         cookies = await cdp_context.cookies() if cdp_context else []
         log.info("Extracted %d cookies from Chrome session", len(cookies))
-        await cdp_browser.close()
     return cookies
 
 
@@ -110,7 +161,6 @@ async def _open_hex_login_async(port: int = CHROME_DEBUG_PORT) -> None:
                 await page.bring_to_front()
                 await page.goto(HEX_LOGIN_URL, wait_until="load", timeout=30_000)
                 log.info("Opened Hex login page in real Chrome")
-            await browser.close()
         except Exception as exc:
             log.warning("Could not open Hex login page in Chrome: %s", exc)
 
@@ -125,332 +175,340 @@ async def _screenshot_one(p, url: str, cookies: list) -> bytes:
     from io import BytesIO
     from PIL import Image
 
-    # Each report gets its own headless browser so they are fully isolated
-    log.info("[%s] Launching headless browser …", url[:60])
+    # Keep report generation headless so it never steals focus from the user.
     browser = await p.chromium.launch(headless=True)
     context = await browser.new_context(viewport={"width": 1600, "height": 900})
-
     if cookies:
         await context.add_cookies(cookies)
         log.info("[%s] Injected %d cookies", url[:60], len(cookies))
 
-        page = await context.new_page()
-        try:
-            log.info("Navigating to: %s", url)
-            await page.goto(url, wait_until="load", timeout=60_000)
+    page = await context.new_page()
+    try:
+        log.info("Navigating to: %s", url)
+        await page.goto(url, wait_until="load", timeout=60_000)
 
-            # Detect login redirect before doing any waiting
-            if "/login" in page.url or "/auth/" in page.url:
-                raise HexLoginRequired(
-                    f"Hex redirected to login page ({page.url}). "
-                    "Please log in to Hex first."
-                )
-
-            # Hex is a heavy JS app — wait for content to finish rendering.
-            # The spinner appears a few seconds AFTER navigation, so we must:
-            #   Phase 1 – initial pause to let the page start loading data
-            #   Phase 2 – wait for the spinner to appear (so we know loading started)
-            #   Phase 3 – wait for the spinner to disappear (loading finished)
-            #   Phase 4 – wait for scroll height to stabilise
-
-            SPINNER_JS = "() => document.querySelectorAll('[class*=\"HexSpinner__SpinnerWrapper\"]').length"
-            GET_HEIGHT_JS = """
+        async def _looks_like_login() -> bool:
+            return await page.evaluate("""
                 () => {
-                    const el = document.getElementById('cellScrollParent-app')
-                              || Array.from(document.querySelectorAll('*')).reduce((best, el) => {
-                                  const style = window.getComputedStyle(el);
-                                  const isScrollable = (style.overflow === 'auto' || style.overflow === 'scroll' ||
-                                                        style.overflowY === 'auto' || style.overflowY === 'scroll');
-                                  return (isScrollable && el.scrollHeight > best.scrollHeight) ? el : best;
-                              }, document.body);
-                    return el ? el.scrollHeight : 0;
+                    const text = (document.body?.innerText || '').toLowerCase();
+                    return text.includes('log in with sso')
+                        || text.includes('logging in')
+                        || text.includes('sign up for hex')
+                        || text.includes('log in to another workspace');
                 }
-            """
+            """)
 
-            # Phase 1: initial pause (spinner hasn't appeared yet at 2 s)
-            log.info("Phase 1: initial 5 s pause …")
-            await page.wait_for_timeout(5000)
+        # Detect login state before doing any waiting
+        if "/login" in page.url or "/auth/" in page.url or await _looks_like_login():
+            raise HexLoginRequired(
+                f"Hex is showing a login page ({page.url}). "
+                "Please log in to Hex in Chrome first."
+            )
 
-            # Phase 2: wait for spinner to appear (up to 15 s)
-            log.info("Phase 2: waiting for spinner to appear …")
-            for attempt in range(15):
-                count = await page.evaluate(SPINNER_JS)
-                log.info("  spinner check %d: %d spinner(s)", attempt + 1, count)
-                if count > 0:
-                    log.info("  spinner appeared — moving to phase 3")
+        # Hex is a heavy JS app — wait for content to finish rendering.
+        # The spinner appears a few seconds AFTER navigation, so we must:
+        #   Phase 1 – initial pause to let the page start loading data
+        #   Phase 2 – wait for the spinner to appear (so we know loading started)
+        #   Phase 3 – wait for the spinner to disappear (loading finished)
+        #   Phase 4 – wait for scroll height to stabilise
+
+        SPINNER_JS = "() => document.querySelectorAll('[class*=\"HexSpinner__SpinnerWrapper\"]').length"
+        GET_HEIGHT_JS = """
+            () => {
+                const el = document.getElementById('cellScrollParent-app')
+                          || Array.from(document.querySelectorAll('*')).reduce((best, el) => {
+                              const style = window.getComputedStyle(el);
+                              const isScrollable = (style.overflow === 'auto' || style.overflow === 'scroll' ||
+                                                    style.overflowY === 'auto' || style.overflowY === 'scroll');
+                              return (isScrollable && el.scrollHeight > best.scrollHeight) ? el : best;
+                          }, document.body);
+                return el ? el.scrollHeight : 0;
+            }
+        """
+
+        # Phase 1: initial pause (spinner hasn't appeared yet at 2 s)
+        log.info("Phase 1: initial 5 s pause …")
+        await page.wait_for_timeout(5000)
+
+        if await _looks_like_login():
+            raise HexLoginRequired(
+                f"Hex is showing a login page after load ({page.url}). "
+                "Please log in to Hex in Chrome first."
+            )
+
+        # Phase 2: wait for spinner to appear (up to 15 s)
+        log.info("Phase 2: waiting for spinner to appear …")
+        for attempt in range(15):
+            count = await page.evaluate(SPINNER_JS)
+            log.info("  spinner check %d: %d spinner(s)", attempt + 1, count)
+            if count > 0:
+                log.info("  spinner appeared — moving to phase 3")
+                break
+            await page.wait_for_timeout(1000)
+
+        # Phase 3: wait for spinner to disappear (up to 90 s)
+        log.info("Phase 3: waiting for spinner to clear …")
+        for attempt in range(45):
+            count = await page.evaluate(SPINNER_JS)
+            log.info("  spinner poll %d: %d spinner(s) visible", attempt + 1, count)
+            if count == 0:
+                log.info("  spinner gone after %d polls", attempt + 1)
+                break
+            await page.wait_for_timeout(2000)
+        else:
+            log.warning("Spinner did not clear within timeout — proceeding anyway")
+
+        # Phase 4: wait for scroll height to stabilise
+        log.info("Phase 4: waiting for scroll height to stabilise …")
+        stable_count = 0
+        last_height = 0
+        for attempt in range(10):  # max 20 s
+            await page.wait_for_timeout(2000)
+            height = await page.evaluate(GET_HEIGHT_JS)
+            log.info("  height poll %d: scrollHeight=%d", attempt + 1, height)
+            if height > 0 and height == last_height:
+                stable_count += 1
+                if stable_count >= 2:
+                    log.info("Height stable at %d px", height)
                     break
-                await page.wait_for_timeout(1000)
-
-            # Phase 3: wait for spinner to disappear (up to 90 s)
-            log.info("Phase 3: waiting for spinner to clear …")
-            for attempt in range(45):
-                count = await page.evaluate(SPINNER_JS)
-                log.info("  spinner poll %d: %d spinner(s) visible", attempt + 1, count)
-                if count == 0:
-                    log.info("  spinner gone after %d polls", attempt + 1)
-                    break
-                await page.wait_for_timeout(2000)
             else:
-                log.warning("Spinner did not clear within timeout — proceeding anyway")
+                stable_count = 0
+            last_height = height
 
-            # Phase 4: wait for scroll height to stabilise
-            log.info("Phase 4: waiting for scroll height to stabilise …")
-            stable_count = 0
-            last_height = 0
-            for attempt in range(10):  # max 20 s
-                await page.wait_for_timeout(2000)
-                height = await page.evaluate(GET_HEIGHT_JS)
-                log.info("  height poll %d: scrollHeight=%d", attempt + 1, height)
-                if height > 0 and height == last_height:
-                    stable_count += 1
-                    if stable_count >= 2:
-                        log.info("Height stable at %d px", height)
-                        break
-                else:
-                    stable_count = 0
-                last_height = height
+        if await _looks_like_login():
+            raise HexLoginRequired(
+                f"Hex is showing a login page before screenshot ({page.url}). "
+                "Please log in to Hex in Chrome first."
+            )
 
-            # Find the tallest scrollable container (Hex uses a custom scroll div)
-            scroll_info = await page.evaluate("""
-                () => {
-                    const el = Array.from(document.querySelectorAll('*')).reduce((best, el) => {
-                        const style = window.getComputedStyle(el);
-                        const isScrollable = (style.overflow === 'auto' || style.overflow === 'scroll' ||
-                                              style.overflowY === 'auto' || style.overflowY === 'scroll');
-                        return (isScrollable && el.scrollHeight > best.scrollHeight) ? el : best;
-                    }, document.body);
-                    return { scrollHeight: el.scrollHeight, tag: el.tagName, id: el.id, className: el.className.slice(0, 60) };
-                }
-            """)
-            log.info("Scroll container: %s (scrollHeight=%d)", scroll_info, scroll_info['scrollHeight'])
+        # Find the tallest scrollable container (Hex uses a custom scroll div)
+        scroll_info = await page.evaluate("""
+            () => {
+                const el = Array.from(document.querySelectorAll('*')).reduce((best, el) => {
+                    const style = window.getComputedStyle(el);
+                    const isScrollable = (style.overflow === 'auto' || style.overflow === 'scroll' ||
+                                          style.overflowY === 'auto' || style.overflowY === 'scroll');
+                    return (isScrollable && el.scrollHeight > best.scrollHeight) ? el : best;
+                }, document.body);
+                return { scrollHeight: el.scrollHeight, tag: el.tagName, id: el.id, className: el.className.slice(0, 60) };
+            }
+        """)
+        log.info("Scroll container: %s (scrollHeight=%d)", scroll_info, scroll_info['scrollHeight'])
 
-            total_height = scroll_info['scrollHeight']
+        total_height = scroll_info['scrollHeight']
 
-            # Get the scroll container's bounding rect so we can clip screenshots
-            # to just the content area, excluding the fixed Hex toolbar above it.
-            container_rect = await page.evaluate("""
-                () => {
-                    const el = document.getElementById('cellScrollParent-app')
-                              || Array.from(document.querySelectorAll('*')).reduce((best, el) => {
-                                  const style = window.getComputedStyle(el);
-                                  const isScrollable = (style.overflow === 'auto' || style.overflow === 'scroll' ||
-                                                        style.overflowY === 'auto' || style.overflowY === 'scroll');
-                                  return (isScrollable && el.scrollHeight > best.scrollHeight) ? el : best;
-                              }, document.body);
-                    const r = el.getBoundingClientRect();
-                    return { x: Math.round(r.x), y: Math.round(r.y),
-                             width: Math.round(r.width), height: Math.round(r.height) };
-                }
-            """)
-            log.info("Scroll container rect: %s", container_rect)
+        # Get the scroll container's bounding rect so we can clip screenshots
+        # to just the content area, excluding the fixed Hex toolbar above it.
+        container_rect = await page.evaluate("""
+            () => {
+                const el = document.getElementById('cellScrollParent-app')
+                          || Array.from(document.querySelectorAll('*')).reduce((best, el) => {
+                              const style = window.getComputedStyle(el);
+                              const isScrollable = (style.overflow === 'auto' || style.overflow === 'scroll' ||
+                                                    style.overflowY === 'auto' || style.overflowY === 'scroll');
+                              return (isScrollable && el.scrollHeight > best.scrollHeight) ? el : best;
+                          }, document.body);
+                const r = el.getBoundingClientRect();
+                return { x: Math.round(r.x), y: Math.round(r.y),
+                         width: Math.round(r.width), height: Math.round(r.height) };
+            }
+        """)
+        log.info("Scroll container rect: %s", container_rect)
 
-            # ── Diagnose inner scrollable tables ────────────────────────────────
-            diag = await page.evaluate("""
-                () => {
-                    const main = document.getElementById('cellScrollParent-app');
-                    const results = [];
-                    document.querySelectorAll('*').forEach(el => {
-                        if (el === main) return;
-                        const style = window.getComputedStyle(el);
-                        const scrollable = style.overflow === 'auto'   || style.overflow === 'scroll' ||
-                                           style.overflowY === 'auto'  || style.overflowY === 'scroll' ||
-                                           style.overflowX === 'auto'  || style.overflowX === 'scroll';
-                        if (scrollable && el.scrollHeight > el.clientHeight + 5) {
-                            const rows = el.querySelectorAll('tr, [role=\"row\"]').length;
-                            results.push({
-                                tag:          el.tagName,
-                                id:           el.id || '(none)',
-                                cls:          el.className.slice(0, 80),
-                                scrollHeight: el.scrollHeight,
-                                clientHeight: el.clientHeight,
-                                rowsInDOM:    rows,
-                                childCount:   el.children.length,
-                            });
-                        }
-                    });
-                    // sort largest overflow first
-                    results.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
-                    return results.slice(0, 20);   // top-20 most overflowing
-                }
-            """)
-            log.info("── Inner scrollable elements (top overflowing) ──")
-            for i, d in enumerate(diag):
-                log.info(
-                    "  [%d] <%s> id=%s  scrollH=%d clientH=%d  rowsInDOM=%d children=%d  cls=%.80s",
-                    i, d['tag'], d['id'], d['scrollHeight'], d['clientHeight'],
-                    d['rowsInDOM'], d['childCount'], d['cls']
-                )
-            if not diag:
-                log.info("  (no inner scrollable overflow found — page may use virtual scrolling or not yet rendered)")
-
-            # ── Expand inner scrollable tables so every row is visible ──────────
-            # AG Grid puts rows in an overflow:auto div with a fixed height.
-            # Strategy:
-            #   1. Find every overflowing inner table (ag-body-viewport).
-            #   2. Walk up to find its Hex "cell" — the direct child of main.
-            #   3. Grow that cell by `extra` px so all cells below it shift down
-            #      (no overlap).
-            #   4. Set overflow:visible only on elements BETWEEN the table and the
-            #      cell boundary so the extra rows are visible inside the cell.
-            expanded = await page.evaluate("""
-                () => {
-                    const main = document.getElementById('cellScrollParent-app');
-                    let count = 0;
-                    document.querySelectorAll('*').forEach(el => {
-                        if (el === main || !main.contains(el)) return;
-                        const style = window.getComputedStyle(el);
-                        const scrollable = style.overflow === 'auto'   || style.overflow === 'scroll' ||
-                                           style.overflowY === 'auto'  || style.overflowY === 'scroll' ||
-                                           style.overflowX === 'auto'  || style.overflowX === 'scroll';
-                        if (scrollable && el.scrollHeight > el.clientHeight + 2) {
-                            const extra = el.scrollHeight - el.clientHeight;
-
-                            // Find the direct child of main that contains this table
-                            let hexCell = el;
-                            while (hexCell.parentElement && hexCell.parentElement !== main) {
-                                hexCell = hexCell.parentElement;
-                            }
-
-                            // Grow the Hex cell so subsequent cells are pushed down
-                            const cellH = parseFloat(window.getComputedStyle(hexCell).height);
-                            if (!isNaN(cellH)) {
-                                hexCell.style.height    = (cellH + extra) + 'px';
-                                hexCell.style.maxHeight = 'none';
-                            }
-
-                            // Expand the inner table itself
-                            el.style.height    = el.scrollHeight + 'px';
-                            el.style.maxHeight = 'none';
-                            el.style.overflow  = 'visible';
-
-                            // Remove overflow clipping on every layer between el and hexCell
-                            // so the extra rows are visible within the (now-taller) hexCell
-                            let parent = el.parentElement;
-                            while (parent && parent !== hexCell) {
-                                parent.style.overflow  = 'visible';
-                                parent.style.maxHeight = 'none';
-                                parent = parent.parentElement;
-                            }
-
-                            count++;
-                        }
-                    });
-                    return count;
-                }
-            """)
-            log.info("Expanded %d inner scrollable element(s); Hex cells grown to match", expanded)
-
-            # ── Post-expansion: check row counts again to detect virtual scrolling
-            post_diag = await page.evaluate("""
-                () => {
-                    const results = [];
-                    document.querySelectorAll('*').forEach(el => {
+        # ── Diagnose inner scrollable tables ────────────────────────────────
+        diag = await page.evaluate("""
+            () => {
+                const main = document.getElementById('cellScrollParent-app')
+                          || Array.from(document.querySelectorAll('*')).reduce((best, el) => {
+                              const style = window.getComputedStyle(el);
+                              const isScrollable = (style.overflow === 'auto' || style.overflow === 'scroll' ||
+                                                    style.overflowY === 'auto' || style.overflowY === 'scroll');
+                              return (isScrollable && el.scrollHeight > best.scrollHeight) ? el : best;
+                          }, document.body);
+                const results = [];
+                document.querySelectorAll('*').forEach(el => {
+                    if (el === main) return;
+                    const style = window.getComputedStyle(el);
+                    const scrollable = style.overflow === 'auto'   || style.overflow === 'scroll' ||
+                                       style.overflowY === 'auto'  || style.overflowY === 'scroll' ||
+                                       style.overflowX === 'auto'  || style.overflowX === 'scroll';
+                    if (scrollable && el.scrollHeight > el.clientHeight + 5) {
                         const rows = el.querySelectorAll('tr, [role=\"row\"]').length;
-                        if (rows > 0) {
-                            results.push({
-                                tag: el.tagName,
-                                id:  el.id || '(none)',
-                                cls: el.className.slice(0, 80),
-                                rows: rows,
-                            });
+                        results.push({
+                            tag:          el.tagName,
+                            id:           el.id || '(none)',
+                            cls:          el.className.slice(0, 80),
+                            scrollHeight: el.scrollHeight,
+                            clientHeight: el.clientHeight,
+                            rowsInDOM:    rows,
+                            childCount:   el.children.length,
+                        });
+                    }
+                });
+                results.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+                return results.slice(0, 20);
+            }
+        """)
+        log.info("── Inner scrollable elements (top overflowing) ──")
+        for i, d in enumerate(diag):
+            log.info(
+                "  [%d] <%s> id=%s  scrollH=%d clientH=%d  rowsInDOM=%d children=%d  cls=%.80s",
+                i, d['tag'], d['id'], d['scrollHeight'], d['clientHeight'],
+                d['rowsInDOM'], d['childCount'], d['cls']
+            )
+        if not diag:
+            log.info("  (no inner scrollable overflow found — page may use virtual scrolling or not yet rendered)")
+
+        # ── Expand inner scrollable tables so every row is visible ──────────
+        expanded = await page.evaluate("""
+            () => {
+                const main = document.getElementById('cellScrollParent-app')
+                          || Array.from(document.querySelectorAll('*')).reduce((best, el) => {
+                              const style = window.getComputedStyle(el);
+                              const isScrollable = (style.overflow === 'auto' || style.overflow === 'scroll' ||
+                                                    style.overflowY === 'auto' || style.overflowY === 'scroll');
+                              return (isScrollable && el.scrollHeight > best.scrollHeight) ? el : best;
+                          }, document.body);
+                if (!main) return 0;
+                let count = 0;
+                document.querySelectorAll('*').forEach(el => {
+                    if (el === main || !main.contains || !main.contains(el)) return;
+                    const style = window.getComputedStyle(el);
+                    const scrollable = style.overflow === 'auto'   || style.overflow === 'scroll' ||
+                                       style.overflowY === 'auto'  || style.overflowY === 'scroll' ||
+                                       style.overflowX === 'auto'  || style.overflowX === 'scroll';
+                    if (scrollable && el.scrollHeight > el.clientHeight + 2) {
+                        const extra = el.scrollHeight - el.clientHeight;
+                        let hexCell = el;
+                        while (hexCell.parentElement && hexCell.parentElement !== main) {
+                            hexCell = hexCell.parentElement;
                         }
-                    });
-                    // deduplicate: keep only the element with the most rows per unique count
-                    const seen = new Set();
-                    return results.filter(r => {
-                        if (seen.has(r.rows)) return false;
-                        seen.add(r.rows);
-                        return true;
-                    }).sort((a, b) => b.rows - a.rows).slice(0, 10);
-                }
-            """)
-            log.info("── Row counts in DOM after expansion ──")
-            for d in post_diag:
-                log.info("  <%s> id=%s  rows=%d  cls=%.80s", d['tag'], d['id'], d['rows'], d['cls'])
-            if not post_diag:
-                log.info("  (no tr/[role=row] elements found at all)")
-            # ────────────────────────────────────────────────────────────────────
+                        const cellH = parseFloat(window.getComputedStyle(hexCell).height);
+                        if (!isNaN(cellH)) {
+                            hexCell.style.height    = (cellH + extra) + 'px';
+                            hexCell.style.maxHeight = 'none';
+                        }
+                        el.style.height    = el.scrollHeight + 'px';
+                        el.style.maxHeight = 'none';
+                        el.style.overflow  = 'visible';
+                        let parent = el.parentElement;
+                        while (parent && parent !== hexCell) {
+                            parent.style.overflow  = 'visible';
+                            parent.style.maxHeight = 'none';
+                            parent = parent.parentElement;
+                        }
+                        count++;
+                    }
+                });
+                return count;
+            }
+        """)
+        log.info("Expanded %d inner scrollable element(s); Hex cells grown to match", expanded)
 
-            # After expanding tables the outer scroll container grows — re-read it
-            await page.wait_for_timeout(400)
-            new_scroll = await page.evaluate("""
-                () => {
-                    const el = document.getElementById('cellScrollParent-app');
-                    return el ? el.scrollHeight : document.body.scrollHeight;
-                }
-            """)
-            if new_scroll != total_height:
-                log.info("Outer scrollHeight updated: %d → %d px", total_height, new_scroll)
-                total_height = new_scroll
-            # ────────────────────────────────────────────────────────────────────
+        post_diag = await page.evaluate("""
+            () => {
+                const results = [];
+                document.querySelectorAll('*').forEach(el => {
+                    const rows = el.querySelectorAll('tr, [role=\"row\"]').length;
+                    if (rows > 0) {
+                        results.push({
+                            tag: el.tagName,
+                            id:  el.id || '(none)',
+                            cls: el.className.slice(0, 80),
+                            rows: rows,
+                        });
+                    }
+                });
+                const seen = new Set();
+                return results.filter(r => {
+                    if (seen.has(r.rows)) return false;
+                    seen.add(r.rows);
+                    return true;
+                }).sort((a, b) => b.rows - a.rows).slice(0, 10);
+            }
+        """)
+        log.info("── Row counts in DOM after expansion ──")
+        for d in post_diag:
+            log.info("  <%s> id=%s  rows=%d  cls=%.80s", d['tag'], d['id'], d['rows'], d['cls'])
+        if not post_diag:
+            log.info("  (no tr/[role=row] elements found at all)")
 
-            clip_x      = container_rect['x']
-            clip_y      = container_rect['y']
-            clip_width  = container_rect['width']
-            clip_height = container_rect['height']   # visible content rows per chunk
+        await page.wait_for_timeout(400)
+        new_scroll = await page.evaluate("""
+            () => {
+                const el = document.getElementById('cellScrollParent-app');
+                return el ? el.scrollHeight : document.body.scrollHeight;
+            }
+        """)
+        if new_scroll != total_height:
+            log.info("Outer scrollHeight updated: %d → %d px", total_height, new_scroll)
+            total_height = new_scroll
 
-            log.info("Capturing %d px in chunks (clip_height=%d) …", total_height, clip_height)
+        clip_x      = container_rect['x']
+        clip_y      = container_rect['y']
+        clip_width  = container_rect['width']
+        clip_height = container_rect['height']
 
-            scroll_js = """
-                (target) => {
-                    const el = document.getElementById('cellScrollParent-app')
-                              || Array.from(document.querySelectorAll('*')).reduce((best, el) => {
-                                  const style = window.getComputedStyle(el);
-                                  const isScrollable = (style.overflow === 'auto' || style.overflow === 'scroll' ||
-                                                        style.overflowY === 'auto' || style.overflowY === 'scroll');
-                                  return (isScrollable && el.scrollHeight > best.scrollHeight) ? el : best;
-                              }, document.body);
-                    el.scrollTop = target;
-                    return el.scrollTop;   // return actual clamped value
-                }
-            """
+        log.info("Capturing %d px in chunks (clip_height=%d) …", total_height, clip_height)
 
-            chunks = []
-            prev_actual_top = 0   # actual scrollTop of the previous chunk
-            y = 0
-            while y < total_height:
-                actual_top = await page.evaluate(scroll_js, y)
-                await page.wait_for_timeout(600)
+        scroll_js = """
+            (target) => {
+                const el = document.getElementById('cellScrollParent-app')
+                          || Array.from(document.querySelectorAll('*')).reduce((best, el) => {
+                              const style = window.getComputedStyle(el);
+                              const isScrollable = (style.overflow === 'auto' || style.overflow === 'scroll' ||
+                                                    style.overflowY === 'auto' || style.overflowY === 'scroll');
+                              return (isScrollable && el.scrollHeight > best.scrollHeight) ? el : best;
+                          }, document.body);
+                el.scrollTop = target;
+                return el.scrollTop;
+            }
+        """
 
-                chunk_bytes = await page.screenshot(clip={
-                    "x": clip_x,
-                    "y": clip_y,
-                    "width": clip_width,
-                    "height": clip_height,
-                })
-                img = Image.open(BytesIO(chunk_bytes))
+        chunks = []
+        prev_actual_top = 0
+        y = 0
+        while y < total_height:
+            actual_top = await page.evaluate(scroll_js, y)
+            await page.wait_for_timeout(600)
 
-                # If the browser clamped scrollTop below our requested y, this chunk
-                # overlaps with the previous one.  Crop the repeated rows off the top.
-                overlap_px = (prev_actual_top + clip_height) - actual_top
-                if overlap_px > 0 and chunks:
-                    log.info("  chunk y=%d actual_top=%d overlap=%d px — cropping top",
-                             y, actual_top, overlap_px)
-                    img = img.crop((0, overlap_px, img.width, img.height))
+            chunk_bytes = await page.screenshot(clip={
+                "x": clip_x,
+                "y": clip_y,
+                "width": clip_width,
+                "height": clip_height,
+            })
+            img = Image.open(BytesIO(chunk_bytes))
 
-                if img.height > 0:
-                    chunks.append(img)
+            overlap_px = (prev_actual_top + clip_height) - actual_top
+            if overlap_px > 0 and chunks:
+                log.info("  chunk y=%d actual_top=%d overlap=%d px — cropping top",
+                         y, actual_top, overlap_px)
+                img = img.crop((0, overlap_px, img.width, img.height))
 
-                prev_actual_top = actual_top
-                y += clip_height
+            if img.height > 0:
+                chunks.append(img)
 
-            # Stitch all chunks into one tall image
-            total_width = chunks[0].width
-            stitched_height = sum(c.height for c in chunks)
-            stitched = Image.new("RGB", (total_width, stitched_height))
-            offset = 0
-            for chunk in chunks:
-                stitched.paste(chunk, (0, offset))
-                offset += chunk.height
+            prev_actual_top = actual_top
+            y += clip_height
 
-            buf = BytesIO()
-            stitched.save(buf, format="PNG")
-            png_bytes = buf.getvalue()
-            log.info("Full screenshot captured: %d bytes (%d chunks)", len(png_bytes), len(chunks))
-            return png_bytes
-        finally:
+        total_width = chunks[0].width
+        stitched_height = sum(c.height for c in chunks)
+        stitched = Image.new("RGB", (total_width, stitched_height))
+        offset = 0
+        for chunk in chunks:
+            stitched.paste(chunk, (0, offset))
+            offset += chunk.height
+
+        buf = BytesIO()
+        stitched.save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+        log.info("Full screenshot captured: %d bytes (%d chunks)", len(png_bytes), len(chunks))
+        return png_bytes
+    finally:
+        if page:
             await page.close()
-            await browser.close()
+        await browser.close()
 
 
 async def _screenshot_async(url: str, cookies: list) -> bytes:
@@ -480,7 +538,7 @@ async def _screenshot_all_async(leaders: list[dict], cookies: list) -> dict:
     return results
 
 
-def screenshot_hex_url(url: str, port: int = CHROME_DEBUG_PORT, cookies: list | None = None) -> bytes:
+def screenshot_hex_url(url: str, port: int = CHROME_DEBUG_PORT, cookies: Optional[list] = None) -> bytes:
     """
     Screenshot *url* in a headless browser using session cookies from Chrome.
 
@@ -532,4 +590,3 @@ if __name__ == "__main__":
     with open(out_path, "wb") as f:
         f.write(png_bytes)
     print(f"Screenshot saved to {out_path}  ({len(png_bytes):,} bytes)")
-

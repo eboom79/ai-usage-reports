@@ -25,6 +25,7 @@ import re
 import threading
 from datetime import datetime
 from io import BytesIO
+from typing import Optional
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -39,7 +40,7 @@ TEAM_LEADERS_FILE = os.getenv("TEAM_LEADERS_FILE", "team_leaders.json")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "eyal.boumgarten@redis.com").lower()
 
 if not MOCK_MODE:
-    from hex_screenshot import _extract_cookies_async, _screenshot_one, _open_hex_login_async, HexLoginRequired, launch_chrome_to_login
+    from hex_screenshot import CHROME_DEBUG_PORT, _extract_cookies_async, _screenshot_one, _open_hex_login_async, HexLoginRequired, launch_chrome_to_login
     from playwright.async_api import async_playwright
 
 # ── Report cache: email (lowercase) → {png: bytes, ts: datetime} ─────────────
@@ -214,7 +215,7 @@ def _load_team_leaders() -> list[dict]:
     return _flatten_tree(_load_tree())
 
 
-def _find_leader_by_query(query: str) -> dict | None:
+def _find_leader_by_query(query: str) -> Optional[dict]:
     """Find a person by full name, first name, or surname (case-insensitive)."""
     q = query.strip().lower()
     if not q:
@@ -259,7 +260,7 @@ def _reply(say, thread_ts: str, text: str) -> None:
     say(text=text, thread_ts=thread_ts)
 
 
-def _send_dm(client, user_id: str, text: str, blocks: list | None = None) -> None:
+def _send_dm(client, user_id: str, text: str, blocks: Optional[list] = None) -> None:
     """Open a DM channel with the user and post a message."""
     dm = client.conversations_open(users=[user_id])
     dm_channel = dm["channel"]["id"]
@@ -284,13 +285,13 @@ def _generate_one_in_background(client, channel: str, thread_ts: str, leader: di
             return
 
         try:
-            cookies = await _extract_cookies_async(9222)
+            cookies = await _extract_cookies_async(CHROME_DEBUG_PORT)
         except Exception:
             log.warning("Chrome not reachable — launching and retrying in 4 s …")
             launch_chrome_to_login()
             await asyncio.sleep(4)
             try:
-                cookies = await _extract_cookies_async(9222)
+                cookies = await _extract_cookies_async(CHROME_DEBUG_PORT)
                 log.info("Chrome started successfully, proceeding with report generation.")
             except Exception as exc:
                 log.error("Chrome still not reachable after launch: %s", exc)
@@ -336,13 +337,13 @@ def _generate_all_in_background(client, channel: str, thread_ts: str) -> None:
     async def _run() -> None:
         leaders = _load_team_leaders()
         try:
-            cookies = await _extract_cookies_async(9222)
+            cookies = await _extract_cookies_async(CHROME_DEBUG_PORT)
         except Exception:
             log.warning("Chrome not reachable — launching and retrying in 4 s …")
             launch_chrome_to_login()
             await asyncio.sleep(4)
             try:
-                cookies = await _extract_cookies_async(9222)
+                cookies = await _extract_cookies_async(CHROME_DEBUG_PORT)
                 log.info("Chrome started successfully, proceeding with batch generation.")
             except Exception as exc:
                 log.error("Chrome still not reachable after launch: %s", exc)
@@ -650,4 +651,3 @@ if __name__ == "__main__":
         handler.start()
     finally:
         _release_pid_file()
-

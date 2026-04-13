@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Generate screenshots for all team leaders and upload them to Google Drive.
+Generate screenshots for team leaders and upload them to Google Drive.
 
 Usage:
     python3 generate_all_reports.py
+    python3 generate_all_reports.py --name "Alice Smith"
+    python3 generate_all_reports.py --name "Alice Smith" --name "Bob Jones"
 """
+import argparse
 import json
 import asyncio
 import logging
 import os
 from datetime import datetime
 from io import BytesIO
+from typing import Optional
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -18,7 +22,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s")
 log = logging.getLogger(__name__)
 
-from hex_screenshot import _extract_cookies_async, _screenshot_one, launch_chrome_to_login
+from hex_screenshot import CHROME_DEBUG_PORT, _extract_cookies_async, _screenshot_one, launch_chrome_to_login
 from playwright.async_api import async_playwright
 
 TEAM_LEADERS_FILE        = os.getenv("TEAM_LEADERS_FILE", "team_leaders.json")
@@ -124,17 +128,30 @@ def _load_team_leaders() -> list[dict]:
         return flatten(json.load(f))
 
 
-async def run_all():
+def _select_leaders(name_filters: Optional[list[str]] = None) -> list[dict]:
     leaders = _load_team_leaders()
+    if not name_filters:
+        return leaders
+
+    wanted = {name.strip().lower() for name in name_filters if name.strip()}
+    selected = [leader for leader in leaders if leader["name"].strip().lower() in wanted]
+    missing = sorted(wanted - {leader["name"].strip().lower() for leader in selected})
+    if missing:
+        raise ValueError(f"Unknown team leader(s): {', '.join(missing)}")
+    return selected
+
+
+async def run_all(name_filters: Optional[list[str]] = None):
+    leaders = _select_leaders(name_filters)
     log.info("Generating reports for %d team leaders...", len(leaders))
 
     try:
-        cookies = await _extract_cookies_async(9222)
+        cookies = await _extract_cookies_async(CHROME_DEBUG_PORT)
     except Exception:
         log.warning("Chrome not running — launching it now. Please log in to Hex if prompted, then the script will continue in 10 seconds...")
         launch_chrome_to_login()
         await asyncio.sleep(10)
-        cookies = await _extract_cookies_async(9222)
+        cookies = await _extract_cookies_async(CHROME_DEBUG_PORT)
     log.info("Cookies extracted: %d", len(cookies))
 
     success, failed = 0, 0
@@ -159,8 +176,17 @@ async def run_all():
 
     log.info("All done! %d succeeded, %d failed.", success, failed)
     _notify_slack(success, failed)
+    return success, failed
 
 
 if __name__ == "__main__":
-    asyncio.run(run_all())
+    parser = argparse.ArgumentParser(description="Generate AI Usage reports.")
+    parser.add_argument(
+        "--name",
+        action="append",
+        help="Generate a report only for the given team leader name. Repeat to select multiple.",
+    )
+    args = parser.parse_args()
 
+    success, failed = asyncio.run(run_all(args.name))
+    raise SystemExit(0 if failed == 0 else 1)
