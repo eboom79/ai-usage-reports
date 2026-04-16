@@ -89,6 +89,12 @@ cp .env.example .env
 python3 slack_bot.py
 ```
 
+To run the bot with a different env file, pass `--env-file`:
+
+```bash
+python3 slack_bot.py --env-file .env0
+```
+
 ### Generating Reports
 
 ```bash
@@ -108,3 +114,33 @@ google-chrome --remote-debugging-port=9222
 3. Install dependencies (same as above)
 4. Set `SERVE_ONLY=true` in `.env`
 5. Use `supervisor` to keep the bot running 24/7
+
+### Deploying on env0 / AWS
+
+For env0, the simplest setup is to run the Slack bot as a long-lived process on an AWS VM and inject secrets as environment variables.
+
+Recommended env0 variables:
+
+| Variable | Purpose |
+|---|---|
+| `SLACK_BOT_TOKEN` | Slack bot token |
+| `SLACK_APP_TOKEN` | Slack app-level Socket Mode token |
+| `SLACK_CHANNEL_ID` | Optional channel restriction |
+| `SERVE_ONLY=true` | Disable local report generation on the server |
+| `GOOGLE_DRIVE_FOLDER_ID` | Google Drive folder holding generated reports |
+| `GOOGLE_DRIVE_CREDENTIALS_JSON` | Full Google service-account JSON as a secret env var |
+| `REPORTS_DIR=.hex_reports` | Local cache directory on the instance |
+| `ENV_FILE=.env` | Optional if you still want a dotenv file loaded |
+
+Startup command:
+
+```bash
+./run_env0_bot.sh
+```
+
+Notes:
+
+1. `run_env0_bot.sh` creates a local virtualenv in `.venv`, installs `requirements.txt`, and starts the Slack bot.
+2. The bot now supports `GOOGLE_DRIVE_CREDENTIALS_JSON`, which is usually easier to manage in env0 than shipping a JSON file path to the instance.
+3. If env0 injects variables directly into the process, the `.env` file can be minimal or even absent.
+4. This bot is designed for a single long-running instance because it keeps a PID file at `/tmp/slack_bot.pid`.

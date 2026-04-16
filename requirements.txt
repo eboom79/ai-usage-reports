@@ -4,4 +4,5 @@ schedule>=1.2.0
 slack_bolt>=1.18.0
 playwright>=1.40.0
 Pillow>=10.0.0
-
+google-auth>=2.29.0
+google-api-python-client>=2.126.0

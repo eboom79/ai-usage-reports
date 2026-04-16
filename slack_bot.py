@@ -17,6 +17,7 @@ Setup: see README / .env.example for required tokens and scopes.
 """
 
 import asyncio
+import argparse
 import json
 import logging
 import os
@@ -33,13 +34,26 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from dotenv import load_dotenv
 
-load_dotenv()
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="AI usage Slack bot")
+    parser.add_argument(
+        "--env-file",
+        default=os.getenv("ENV_FILE", ".env"),
+        help="Path to the dotenv file to load before starting the bot.",
+    )
+    return parser.parse_args()
+
+
+ARGS = _parse_args()
+load_dotenv(ARGS.env_file)
 
 MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
+SERVE_ONLY = os.getenv("SERVE_ONLY", "false").lower() == "true"
 TEAM_LEADERS_FILE = os.getenv("TEAM_LEADERS_FILE", "team_leaders.json")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "eyal.boumgarten@redis.com").lower()
 
-if not MOCK_MODE:
+if not MOCK_MODE and not SERVE_ONLY:
     from hex_screenshot import CHROME_DEBUG_PORT, _extract_cookies_async, _screenshot_one, _open_hex_login_async, HexLoginRequired, launch_chrome_to_login
     from playwright.async_api import async_playwright
 
@@ -90,11 +104,11 @@ SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
 SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID", "")   # empty = any channel
 
 GOOGLE_DRIVE_CREDENTIALS = os.getenv("GOOGLE_DRIVE_CREDENTIALS", "")
+GOOGLE_DRIVE_CREDENTIALS_JSON = os.getenv("GOOGLE_DRIVE_CREDENTIALS_JSON", "")
 GOOGLE_DRIVE_FOLDER_ID   = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
 
 # When True: bot only serves cached reports — generation commands are disabled.
 # Set SERVE_ONLY=true in .env on the cloud VM.
-SERVE_ONLY = os.getenv("SERVE_ONLY", "false").lower() == "true"
 
 app = App(token=SLACK_BOT_TOKEN)
 
@@ -105,16 +119,23 @@ def _drive_service():
     """Build and return an authenticated Google Drive service client."""
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
-    creds = service_account.Credentials.from_service_account_file(
-        GOOGLE_DRIVE_CREDENTIALS,
-        scopes=["https://www.googleapis.com/auth/drive.file"],
-    )
+    scopes = ["https://www.googleapis.com/auth/drive.file"]
+    if GOOGLE_DRIVE_CREDENTIALS_JSON:
+        creds = service_account.Credentials.from_service_account_info(
+            json.loads(GOOGLE_DRIVE_CREDENTIALS_JSON),
+            scopes=scopes,
+        )
+    else:
+        creds = service_account.Credentials.from_service_account_file(
+            GOOGLE_DRIVE_CREDENTIALS,
+            scopes=scopes,
+        )
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
 def _upload_to_drive(name: str, email: str, png_bytes: bytes, generated_at: datetime) -> None:
     """Upload a report PNG to Google Drive. Fails silently so it never breaks the main flow."""
-    if not GOOGLE_DRIVE_CREDENTIALS or not GOOGLE_DRIVE_FOLDER_ID:
+    if (not GOOGLE_DRIVE_CREDENTIALS and not GOOGLE_DRIVE_CREDENTIALS_JSON) or not GOOGLE_DRIVE_FOLDER_ID:
         return
     try:
         from googleapiclient.http import MediaIoBaseUpload
@@ -143,7 +164,7 @@ def _upload_to_drive(name: str, email: str, png_bytes: bytes, generated_at: date
 
 def _load_cache_from_drive() -> None:
     """On startup, download the latest report per person from Drive into _report_cache."""
-    if not GOOGLE_DRIVE_CREDENTIALS or not GOOGLE_DRIVE_FOLDER_ID:
+    if (not GOOGLE_DRIVE_CREDENTIALS and not GOOGLE_DRIVE_CREDENTIALS_JSON) or not GOOGLE_DRIVE_FOLDER_ID:
         return
     try:
         service = _drive_service()
@@ -189,6 +210,54 @@ def _load_cache_from_drive() -> None:
 
     except Exception as exc:
         log.error("Failed to load reports from Google Drive: %s", exc)
+
+
+def _refresh_report_from_drive(email: str) -> None:
+    """Refresh one person's latest report from Drive into _report_cache."""
+    if (not GOOGLE_DRIVE_CREDENTIALS and not GOOGLE_DRIVE_CREDENTIALS_JSON) or not GOOGLE_DRIVE_FOLDER_ID:
+        return
+    try:
+        service = _drive_service()
+        results = service.files().list(
+            q=f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents and mimeType='image/png' and trashed=false",
+            fields="files(id, name, properties)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            pageSize=200,
+        ).execute()
+
+        latest_file = None
+        latest_ts = None
+        target_email = email.lower()
+        for f in results.get("files", []):
+            props = f.get("properties") or {}
+            file_email = props.get("email", "").lower()
+            ts_str = props.get("generated_at", "")
+            if file_email != target_email or not ts_str:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str)
+            except ValueError:
+                continue
+            if latest_ts is None or ts > latest_ts:
+                latest_ts = ts
+                latest_file = f
+
+        if not latest_file or latest_ts is None:
+            return
+
+        cached = _report_cache.get(target_email)
+        if cached and cached["ts"] >= latest_ts:
+            return
+
+        png_bytes = service.files().get_media(
+            fileId=latest_file["id"], supportsAllDrives=True
+        ).execute()
+        _report_cache[target_email] = {"png": png_bytes, "ts": latest_ts}
+        log.info("Refreshed report for %s from Google Drive (generated %s)",
+                 target_email, latest_ts.strftime("%Y-%m-%d %H:%M"))
+    except Exception as exc:
+        log.error("Failed to refresh Drive report for %s: %s", email, exc)
 
 # ── Team leader helpers ───────────────────────────────────────────────────────
 
@@ -433,6 +502,7 @@ def _stamp_timestamp(png_bytes: bytes, generated_at: str) -> bytes:
 
 def _send_report_in_background(client, say, thread_ts: str, user_id: str, name: str, email: str) -> None:
     """Upload the cached report PNG directly to the TL's Slack DM."""
+    _refresh_report_from_drive(email)
     log.info("Report lookup for %s: slack_email=%s cache_keys=%s",
              name, email.lower(), list(_report_cache.keys()))
     cached = _report_cache.get(email.lower())

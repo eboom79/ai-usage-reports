@@ -89,7 +89,14 @@ def _upload_to_drive(name: str, email: str, png_bytes: bytes, generated_at: date
             file_id = existing[0]["id"]
             service.files().update(
                 fileId=file_id,
-                body={"name": filename},
+                body={
+                    "name": filename,
+                    "properties": {
+                        "email": email.lower(),
+                        "generated_at": generated_at.isoformat(),
+                        "person_name": name,
+                    },
+                },
                 media_body=media,
                 supportsAllDrives=True,
             ).execute()
@@ -105,6 +112,11 @@ def _upload_to_drive(name: str, email: str, png_bytes: bytes, generated_at: date
             file_metadata = {
                 "name":    filename,
                 "parents": [GOOGLE_DRIVE_FOLDER_ID],
+                "properties": {
+                    "email": email.lower(),
+                    "generated_at": generated_at.isoformat(),
+                    "person_name": name,
+                },
             }
             service.files().create(
                 body=file_metadata, media_body=media, fields="id",

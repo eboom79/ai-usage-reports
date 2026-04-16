@@ -1,6 +1,7 @@
 # Sensitive credentials — never commit these
 .env
 *.json
+.deploy/
 
 # Python
 __pycache__/
