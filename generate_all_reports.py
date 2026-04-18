@@ -22,7 +22,13 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s")
 log = logging.getLogger(__name__)
 
-from hex_screenshot import CHROME_DEBUG_PORT, _extract_cookies_async, _screenshot_one, launch_chrome_to_login
+from hex_screenshot import (
+    CHROME_DEBUG_PORT,
+    _extract_cookies_async,
+    _screenshot_one,
+    launch_chrome_to_login,
+    resolve_chrome_debug_port,
+)
 from playwright.async_api import async_playwright
 
 TEAM_LEADERS_FILE        = os.getenv("TEAM_LEADERS_FILE", "team_leaders.json")
@@ -156,14 +162,16 @@ def _select_leaders(name_filters: Optional[list[str]] = None) -> list[dict]:
 async def run_all(name_filters: Optional[list[str]] = None):
     leaders = _select_leaders(name_filters)
     log.info("Generating reports for %d team leaders...", len(leaders))
+    port = resolve_chrome_debug_port(CHROME_DEBUG_PORT)
 
     try:
-        cookies = await _extract_cookies_async(CHROME_DEBUG_PORT)
+        cookies = await _extract_cookies_async(port)
     except Exception:
         log.warning("Chrome not running — launching it now. Please log in to Hex if prompted, then the script will continue in 10 seconds...")
-        launch_chrome_to_login()
+        launch_chrome_to_login(port)
         await asyncio.sleep(10)
-        cookies = await _extract_cookies_async(CHROME_DEBUG_PORT)
+        port = resolve_chrome_debug_port(port)
+        cookies = await _extract_cookies_async(port)
     log.info("Cookies extracted: %d", len(cookies))
 
     success, failed = 0, 0

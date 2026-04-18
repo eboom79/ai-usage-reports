@@ -54,7 +54,15 @@ TEAM_LEADERS_FILE = os.getenv("TEAM_LEADERS_FILE", "team_leaders.json")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "eyal.boumgarten@redis.com").lower()
 
 if not MOCK_MODE and not SERVE_ONLY:
-    from hex_screenshot import CHROME_DEBUG_PORT, _extract_cookies_async, _screenshot_one, _open_hex_login_async, HexLoginRequired, launch_chrome_to_login
+    from hex_screenshot import (
+        CHROME_DEBUG_PORT,
+        _extract_cookies_async,
+        _screenshot_one,
+        _open_hex_login_async,
+        HexLoginRequired,
+        launch_chrome_to_login,
+        resolve_chrome_debug_port,
+    )
     from playwright.async_api import async_playwright
 
 # ── Report cache: email (lowercase) → {png: bytes, ts: datetime} ─────────────
@@ -354,13 +362,16 @@ def _generate_one_in_background(client, channel: str, thread_ts: str, leader: di
             return
 
         try:
-            cookies = await _extract_cookies_async(CHROME_DEBUG_PORT)
+            port = resolve_chrome_debug_port(CHROME_DEBUG_PORT)
+            cookies = await _extract_cookies_async(port)
         except Exception:
             log.warning("Chrome not reachable — launching and retrying in 4 s …")
-            launch_chrome_to_login()
+            port = resolve_chrome_debug_port(CHROME_DEBUG_PORT)
+            launch_chrome_to_login(port)
             await asyncio.sleep(4)
             try:
-                cookies = await _extract_cookies_async(CHROME_DEBUG_PORT)
+                port = resolve_chrome_debug_port(port)
+                cookies = await _extract_cookies_async(port)
                 log.info("Chrome started successfully, proceeding with report generation.")
             except Exception as exc:
                 log.error("Chrome still not reachable after launch: %s", exc)
@@ -387,7 +398,7 @@ def _generate_one_in_background(client, channel: str, thread_ts: str, leader: di
                     channel=channel, thread_ts=thread_ts,
                     text="🔒 Hex is not logged in. Please log in via the browser that just opened, then try again."
                 )
-                await _open_hex_login_async()
+                await _open_hex_login_async(port)
             except Exception as exc:
                 log.error("Failed to generate report for %s: %s", name, exc)
                 client.chat_postMessage(
@@ -406,13 +417,16 @@ def _generate_all_in_background(client, channel: str, thread_ts: str) -> None:
     async def _run() -> None:
         leaders = _load_team_leaders()
         try:
-            cookies = await _extract_cookies_async(CHROME_DEBUG_PORT)
+            port = resolve_chrome_debug_port(CHROME_DEBUG_PORT)
+            cookies = await _extract_cookies_async(port)
         except Exception:
             log.warning("Chrome not reachable — launching and retrying in 4 s …")
-            launch_chrome_to_login()
+            port = resolve_chrome_debug_port(CHROME_DEBUG_PORT)
+            launch_chrome_to_login(port)
             await asyncio.sleep(4)
             try:
-                cookies = await _extract_cookies_async(CHROME_DEBUG_PORT)
+                port = resolve_chrome_debug_port(port)
+                cookies = await _extract_cookies_async(port)
                 log.info("Chrome started successfully, proceeding with batch generation.")
             except Exception as exc:
                 log.error("Chrome still not reachable after launch: %s", exc)

@@ -16,12 +16,16 @@ Usage (standalone test)
 """
 
 import asyncio
+import json
 import logging
 import os
 import platform
 import shutil
+import socket
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -67,12 +71,74 @@ CHROME_BIN        = _default_chrome_bin()
 CHROME_USER_DATA  = _default_chrome_user_data()
 # Extra seconds to wait after page load so Hex JS charts finish rendering
 RENDER_WAIT_MS = int(os.getenv("HEX_RENDER_WAIT_MS", "6000"))
+FALLBACK_DEBUG_PORTS = (9333, 9444, 9555, 9666)
 
 HEX_LOGIN_URL = "https://app.hex.tech/redis/app/AI-usage-032EARbPw0YYLaJdMcBxfj/latest"
 
 
 class HexLoginRequired(Exception):
     """Raised when Hex redirects to the login page instead of showing a report."""
+
+
+def _is_port_open(port: int, host: str = "127.0.0.1") -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex((host, port)) == 0
+
+
+def _devtools_version(port: int) -> Optional[dict]:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1) as resp:
+            return json.load(resp)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError, ValueError):
+        return None
+
+
+def _is_usable_chrome_devtools(port: int) -> bool:
+    version = _devtools_version(port)
+    if not version:
+        return False
+
+    browser = str(version.get("Browser", ""))
+    user_agent = str(version.get("User-Agent", ""))
+    if not browser.startswith("Chrome/"):
+        return False
+    if "Slack/" in user_agent or "Electron/" in user_agent:
+        return False
+    return True
+
+
+def resolve_chrome_debug_port(preferred: int = CHROME_DEBUG_PORT) -> int:
+    """Return a usable Chrome CDP port, avoiding unrelated apps like Slack."""
+    if _is_usable_chrome_devtools(preferred):
+        return preferred
+
+    if _is_port_open(preferred):
+        version = _devtools_version(preferred)
+        browser = version.get("Browser", "unknown") if version else "unknown"
+        user_agent = version.get("User-Agent", "unknown") if version else "unknown"
+        log.warning(
+            "Port %d is already in use by a non-Chrome DevTools target (%s / %s)",
+            preferred,
+            browser,
+            user_agent,
+        )
+
+    for port in FALLBACK_DEBUG_PORTS:
+        if _is_usable_chrome_devtools(port):
+            log.info("Using existing Chrome DevTools session on port %d", port)
+            return port
+
+    for port in FALLBACK_DEBUG_PORTS:
+        if not _is_port_open(port):
+            if port != preferred:
+                log.info("Port %d unavailable for Chrome; using free fallback port %d", preferred, port)
+            return port
+
+    raise RuntimeError(
+        "Could not find a usable Chrome DevTools port. "
+        f"Tried preferred port {preferred} and fallbacks {', '.join(map(str, FALLBACK_DEBUG_PORTS))}."
+    )
 
 
 def launch_chrome_to_login(port: int = CHROME_DEBUG_PORT) -> None:
@@ -82,6 +148,7 @@ def launch_chrome_to_login(port: int = CHROME_DEBUG_PORT) -> None:
     steals focus — no timing race, no flicker.  Call _focus_chrome_window()
     only when login is actually required.
     """
+    port = resolve_chrome_debug_port(port)
     cmd = [
         CHROME_BIN,
         f"--remote-debugging-port={port}",
@@ -134,6 +201,7 @@ def _focus_chrome_window() -> None:
 async def _extract_cookies_async(port: int) -> list:
     """Connect to Chrome just long enough to grab session cookies, then disconnect."""
     from playwright.async_api import async_playwright
+    port = resolve_chrome_debug_port(port)
     async with async_playwright() as p:
         log.info("Connecting to Chrome on port %d to extract session cookies …", port)
         cdp_browser = await p.chromium.connect_over_cdp(f"http://localhost:{port}")
@@ -151,6 +219,7 @@ def extract_cookies(port: int = CHROME_DEBUG_PORT) -> list:
 async def _open_hex_login_async(port: int = CHROME_DEBUG_PORT) -> None:
     """Raise Chrome, navigate to the Hex login page, and bring it into focus."""
     from playwright.async_api import async_playwright
+    port = resolve_chrome_debug_port(port)
     _focus_chrome_window()   # un-minimize and raise the window
     async with async_playwright() as p:
         try:
