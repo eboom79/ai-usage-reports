@@ -51,6 +51,7 @@ load_dotenv(ARGS.env_file)
 MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
 SERVE_ONLY = os.getenv("SERVE_ONLY", "false").lower() == "true"
 TEAM_LEADERS_FILE = os.getenv("TEAM_LEADERS_FILE", "team_leaders.json")
+TEAM_LEADERS_JSON = os.getenv("TEAM_LEADERS_JSON", "")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "eyal.boumgarten@redis.com").lower()
 
 if not MOCK_MODE and not SERVE_ONLY:
@@ -271,6 +272,12 @@ def _refresh_report_from_drive(email: str) -> None:
 
 def _load_tree() -> list[dict]:
     """Load the full team-leader tree from JSON (returns root list)."""
+    if TEAM_LEADERS_JSON:
+        try:
+            tree = json.loads(TEAM_LEADERS_JSON)
+            return tree if isinstance(tree, list) else []
+        except json.JSONDecodeError:
+            return []
     try:
         with open(TEAM_LEADERS_FILE, "r") as f:
             return json.load(f)
@@ -307,19 +314,45 @@ def _find_leader_by_query(query: str) -> Optional[dict]:
     return None
 
 
+def _email_list(value: object) -> list[str]:
+    """Normalize a JSON string-or-list email field into lowercase emails."""
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    else:
+        return []
+    return [str(v).strip().lower() for v in values if str(v).strip()]
+
+
+def _node_can_access_target(node: dict, target_email: str) -> bool:
+    descendants = _flatten_tree(node.get("reports", []))
+    return any(n.get("email", "").lower() == target_email for n in descendants)
+
+
 def _can_access_report(requester_email: str, target_email: str) -> bool:
-    """True if requester == target, OR target is a descendant of requester in the tree."""
+    """True if requester can access target directly or through inherited JSON access."""
     r = requester_email.lower()
     t = target_email.lower()
     if r == t:
         return True
     tree = _load_tree()
     all_nodes = _flatten_tree(tree)
-    requester_node = next((n for n in all_nodes if n.get("email", "").lower() == r), None)
+    nodes_by_email = {
+        n.get("email", "").lower(): n
+        for n in all_nodes
+        if n.get("email")
+    }
+    requester_node = nodes_by_email.get(r)
     if not requester_node:
         return False
-    descendants = _flatten_tree(requester_node.get("reports", []))
-    return any(n.get("email", "").lower() == t for n in descendants)
+    if _node_can_access_target(requester_node, t):
+        return True
+    for inherited_email in _email_list(requester_node.get("inherits_access_from")):
+        inherited_node = nodes_by_email.get(inherited_email)
+        if inherited_node and (inherited_email == t or _node_can_access_target(inherited_node, t)):
+            return True
+    return False
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

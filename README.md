@@ -130,6 +130,7 @@ Recommended env0 variables:
 | `GOOGLE_DRIVE_FOLDER_ID` | Google Drive folder holding generated reports |
 | `GOOGLE_DRIVE_CREDENTIALS_JSON` | Full Google service-account JSON as a secret env var |
 | `REPORTS_DIR=.hex_reports` | Local cache directory on the instance |
+| `TEAM_LEADERS_JSON` | Full team-leader JSON as a single-line env var, if `team_leaders.json` is not deployed |
 | `ENV_FILE=.env` | Optional if you still want a dotenv file loaded |
 
 Startup command:
@@ -142,5 +143,6 @@ Notes:
 
 1. `run_env0_bot.sh` creates a local virtualenv in `.venv`, installs `requirements.txt`, and starts the Slack bot.
 2. The bot now supports `GOOGLE_DRIVE_CREDENTIALS_JSON`, which is usually easier to manage in env0 than shipping a JSON file path to the instance.
-3. If env0 injects variables directly into the process, the `.env` file can be minimal or even absent.
-4. This bot is designed for a single long-running instance because it keeps a PID file at `/tmp/slack_bot.pid`.
+3. `team_leaders.json` is ignored by git, so env0 should either provide that file on the VM or set `TEAM_LEADERS_JSON` to the full JSON contents.
+4. If env0 injects variables directly into the process, the `.env` file can be minimal or even absent.
+5. This bot is designed for a single long-running instance because it keeps a PID file at `/tmp/slack_bot.pid`.
