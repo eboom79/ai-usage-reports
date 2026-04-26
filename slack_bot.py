@@ -9,6 +9,8 @@ Commands:
   "get report" /
   "report"             – DMs the TL their cached report with the date
                           it was generated.
+  "get report <name>" /
+  "report <name>"      – DMs the requester a named report they can access.
 
 Usage:
     python slack_bot.py
@@ -640,9 +642,9 @@ def handle_generate_all_reports(message, client, say, context) -> None:
         ).start()
 
 
-@app.message(re.compile(r"get\s+report\s+(\S.*\S|\S+)", re.IGNORECASE))
+@app.message(re.compile(r"(?:get\s+)?report\s+(\S.*\S|\S+)", re.IGNORECASE))
 def handle_get_report_for(message, client, say, context) -> None:
-    """Manager command: 'get report <name>' — DMs the requester the named TL's cached report."""
+    """Manager command: 'get report <name>' or 'report <name>' — DMs the requester the named TL's cached report."""
     if message.get("bot_id"):
         return
     # Skip "generate report <name>" — handled by handle_generate_all_reports
@@ -692,8 +694,8 @@ def handle_get_report(message, client, say) -> None:
     # Skip "generate report …" — handled by handle_generate_all_reports
     if re.search(r"generate", text, re.IGNORECASE):
         return
-    # Skip "get report <name>" — handled by handle_get_report_for
-    if re.search(r"get\s+report\s+\S", text, re.IGNORECASE):
+    # Skip "get report <name>" / "report <name>" — handled by handle_get_report_for
+    if re.search(r"(?:get\s+)?report\s+\S", text, re.IGNORECASE):
         return
     if SLACK_CHANNEL_ID and message.get("channel") != SLACK_CHANNEL_ID:
         return

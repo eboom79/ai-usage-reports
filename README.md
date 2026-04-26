@@ -28,7 +28,7 @@ Google Cloud VM (always on)
 | Command | Description |
 |---|---|
 | `report` | Sends you your own cached report as a DM |
-| `get report <name>` | Sends you a specific team leader's report (managers only) |
+| `get report <name>` / `report <name>` | Sends you a specific team leader's report (managers only) |
 | `generate reports` | Generates fresh reports for all team leaders (local bot only) |
 | `generate reports <name>` | Generates a fresh report for one team leader (local bot only) |
 
