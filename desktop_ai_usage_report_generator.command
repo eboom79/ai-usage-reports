@@ -2,7 +2,7 @@
 
 cd "/Users/eyal.boumgarten/Documents/Projects/AI Usage" || exit 1
 
-python3 report_picker.py
+.venv/bin/python3 report_picker.py
 
 exit_code=$?
 echo

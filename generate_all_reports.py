@@ -24,6 +24,7 @@ log = logging.getLogger(__name__)
 
 from hex_screenshot import (
     CHROME_DEBUG_PORT,
+    HexReportIdentityMismatch,
     _extract_cookies_async,
     _screenshot_one,
     launch_chrome_to_login,
@@ -186,10 +187,20 @@ async def run_all(name_filters: Optional[list[str]] = None):
 
             log.info("[%s] Generating...", name)
             try:
-                png = await _screenshot_one(p, url, cookies)
+                png = await _screenshot_one(
+                    p,
+                    url,
+                    cookies,
+                    expected_name=name,
+                    expected_email=email,
+                    expected_manager_email=leader.get("hex_manager_email", ""),
+                )
                 ts  = datetime.now()
                 _upload_to_drive(name, email, png, ts)
                 success += 1
+            except HexReportIdentityMismatch as e:
+                log.error("[%s] Safety check failed — not uploading report: %s", name, e)
+                failed += 1
             except Exception as e:
                 log.error("[%s] ❌ %s", name, e)
                 failed += 1

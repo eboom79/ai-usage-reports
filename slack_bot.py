@@ -63,6 +63,7 @@ if not MOCK_MODE and not SERVE_ONLY:
         _screenshot_one,
         _open_hex_login_async,
         HexLoginRequired,
+        HexReportIdentityMismatch,
         launch_chrome_to_login,
         resolve_chrome_debug_port,
     )
@@ -418,7 +419,14 @@ def _generate_one_in_background(client, channel: str, thread_ts: str, leader: di
 
         async with async_playwright() as p:
             try:
-                png = await _screenshot_one(p, url, cookies)
+                png = await _screenshot_one(
+                    p,
+                    url,
+                    cookies,
+                    expected_name=name,
+                    expected_email=email,
+                    expected_manager_email=leader.get("hex_manager_email", ""),
+                )
                 ts  = datetime.now()
                 _report_cache[email] = {"png": png, "ts": ts}
                 threading.Thread(target=_upload_to_drive, args=(name, email, png, ts), daemon=True).start()
@@ -434,6 +442,12 @@ def _generate_one_in_background(client, channel: str, thread_ts: str, leader: di
                     text="🔒 Hex is not logged in. Please log in via the browser that just opened, then try again."
                 )
                 await _open_hex_login_async(port)
+            except HexReportIdentityMismatch as exc:
+                log.error("Safety check failed for %s: %s", name, exc)
+                client.chat_postMessage(
+                    channel=channel, thread_ts=thread_ts,
+                    text=f"🛑 Safety check failed for *{name}*: `{exc}`. No report was cached or uploaded."
+                )
             except Exception as exc:
                 log.error("Failed to generate report for %s: %s", name, exc)
                 client.chat_postMessage(
@@ -487,7 +501,14 @@ def _generate_all_in_background(client, channel: str, thread_ts: str) -> None:
 
                 log.info("Generating report for %s", name)
                 try:
-                    png = await _screenshot_one(p, url, cookies)
+                    png = await _screenshot_one(
+                        p,
+                        url,
+                        cookies,
+                        expected_name=name,
+                        expected_email=email,
+                        expected_manager_email=leader.get("hex_manager_email", ""),
+                    )
                     ts  = datetime.now()
                     _report_cache[email] = {"png": png, "ts": ts}
                     threading.Thread(target=_upload_to_drive, args=(name, email, png, ts), daemon=True).start()
@@ -504,6 +525,12 @@ def _generate_all_in_background(client, channel: str, thread_ts: str) -> None:
                     )
                     await _open_hex_login_async()
                     return  # Abort — no point continuing without a valid session
+                except HexReportIdentityMismatch as exc:
+                    log.error("Safety check failed for %s: %s", name, exc)
+                    client.chat_postMessage(
+                        channel=channel, thread_ts=thread_ts,
+                        text=f"🛑 Safety check failed for *{name}*: `{exc}`. No report was cached or uploaded."
+                    )
                 except Exception as exc:
                     log.error("Failed to generate report for %s: %s", name, exc)
                     client.chat_postMessage(
@@ -588,7 +615,7 @@ def _send_report_in_background(client, say, thread_ts: str, user_id: str, name: 
 
 # ── Message handlers ──────────────────────────────────────────────────────────
 
-@app.message(re.compile(r"generate\s+reports?\s*(.*)", re.IGNORECASE))
+@app.message(re.compile(r"^\s*generate\s+reports?\s*(.*)\s*$", re.IGNORECASE))
 def handle_generate_all_reports(message, client, say, context) -> None:
     """Generate report(s). With a name → one TL; without → all TLs."""
     if message.get("bot_id"):
@@ -642,7 +669,7 @@ def handle_generate_all_reports(message, client, say, context) -> None:
         ).start()
 
 
-@app.message(re.compile(r"(?:get\s+)?report\s+(\S.*\S|\S+)", re.IGNORECASE))
+@app.message(re.compile(r"^\s*(?:get\s+)?report\s+(.+?)\s*$", re.IGNORECASE))
 def handle_get_report_for(message, client, say, context) -> None:
     """Manager command: 'get report <name>' or 'report <name>' — DMs the requester the named TL's cached report."""
     if message.get("bot_id"):
@@ -685,7 +712,7 @@ def handle_get_report_for(message, client, say, context) -> None:
     ).start()
 
 
-@app.message(re.compile(r"(?:get\s+(?:my\s+)?report|\breport\b)", re.IGNORECASE))
+@app.message(re.compile(r"^\s*(?:report|get\s+(?:my\s+)?report)\s*$", re.IGNORECASE))
 def handle_get_report(message, client, say) -> None:
     """Send the TL their cached report as a DM."""
     if message.get("bot_id"):

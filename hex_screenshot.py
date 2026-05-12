@@ -20,11 +20,13 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Optional
 
@@ -78,6 +80,97 @@ HEX_LOGIN_URL = "https://app.hex.tech/redis/app/AI-usage-032EARbPw0YYLaJdMcBxfj/
 
 class HexLoginRequired(Exception):
     """Raised when Hex redirects to the login page instead of showing a report."""
+
+
+class HexReportIdentityMismatch(Exception):
+    """Raised when the rendered Hex report does not match the requested person."""
+
+
+def _extract_manager_email(url: str) -> str:
+    """Return the decoded _manager email from a Hex URL, if present."""
+    parsed = urllib.parse.urlparse(url)
+    values = urllib.parse.parse_qs(parsed.query).get("_manager", [])
+    if not values:
+        return ""
+    return values[0].strip().strip("\"'").lower()
+
+
+def _normalize_name_text(value: str) -> str:
+    """Normalize rendered text enough for human-name matching."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", value.lower())).strip()
+
+
+def _candidate_report_names(expected_name: str) -> list[str]:
+    """Return strict and common-shortened name forms for report identity checks."""
+    full = " ".join(str(expected_name or "").split())
+    if not full:
+        return []
+
+    candidates = [full]
+    parts = full.split()
+    if len(parts) > 2:
+        candidates.append(f"{parts[0]} {parts[-1]}")
+    return candidates
+
+
+async def _visible_report_identity_text(page) -> str:
+    """Collect text from the top rendered report area, excluding hidden elements."""
+    return await page.evaluate("""
+        () => {
+            const root = document.getElementById('cellScrollParent-app') || document.body;
+            const limit = Math.min(window.innerHeight, 900);
+            const values = [];
+            const seen = new Set();
+
+            const push = (value) => {
+                const text = String(value || '').replace(/\\s+/g, ' ').trim();
+                if (!text || text.length > 1000 || seen.has(text)) return;
+                seen.add(text);
+                values.push(text);
+            };
+
+            root.querySelectorAll('*').forEach(el => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 1 || rect.height < 1 || rect.bottom < 0 || rect.top > limit) return;
+
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return;
+
+                if ('value' in el) push(el.value);
+                push(el.getAttribute('aria-label'));
+                push(el.getAttribute('title'));
+                push(el.innerText || el.textContent);
+            });
+
+            return values.join('\\n');
+        }
+    """)
+
+
+async def _assert_report_identity(page, *, expected_name: Optional[str]) -> None:
+    """Fail closed unless the expected TL name is visible in the rendered report."""
+    candidates = _candidate_report_names(expected_name or "")
+    if not candidates:
+        return
+
+    identity_text = await _visible_report_identity_text(page)
+    normalized_text = _normalize_name_text(identity_text)
+    normalized_candidates = [_normalize_name_text(candidate) for candidate in candidates]
+
+    if any(candidate and candidate in normalized_text for candidate in normalized_candidates):
+        log.info("Report identity check passed for %s", expected_name)
+        return
+
+    sample = re.sub(r"\s+", " ", identity_text).strip()[:500]
+    log.error(
+        "Report identity check failed for %s. Expected one of %s. Visible text sample: %r",
+        expected_name,
+        candidates,
+        sample,
+    )
+    raise HexReportIdentityMismatch(
+        f"expected TL name '{expected_name}' was not visible in the rendered Hex report"
+    )
 
 
 def _is_port_open(port: int, host: str = "127.0.0.1") -> bool:
@@ -239,10 +332,30 @@ def open_hex_login(port: int = CHROME_DEBUG_PORT) -> None:
     asyncio.run(_open_hex_login_async(port))
 
 
-async def _screenshot_one(p, url: str, cookies: list) -> bytes:
+async def _screenshot_one(
+    p,
+    url: str,
+    cookies: list,
+    *,
+    expected_name: Optional[str] = None,
+    expected_email: Optional[str] = None,
+    expected_manager_email: Optional[str] = None,
+) -> bytes:
     """Take a single screenshot using an already-running Playwright instance *p*."""
     from io import BytesIO
     from PIL import Image
+
+    expected_manager = (expected_manager_email or expected_email or "").lower()
+    if expected_manager:
+        manager_email = _extract_manager_email(url)
+        if not manager_email:
+            raise HexReportIdentityMismatch(
+                f"Hex URL for {expected_name or expected_manager} has no _manager filter"
+            )
+        if manager_email != expected_manager:
+            raise HexReportIdentityMismatch(
+                f"Hex URL _manager '{manager_email}' does not match expected manager '{expected_manager}'"
+            )
 
     # Keep report generation headless so it never steals focus from the user.
     browser = await p.chromium.launch(headless=True)
@@ -349,6 +462,8 @@ async def _screenshot_one(p, url: str, cookies: list) -> bytes:
                 f"Hex is showing a login page before screenshot ({page.url}). "
                 "Please log in to Hex in Chrome first."
             )
+
+        await _assert_report_identity(page, expected_name=expected_name)
 
         # Find the tallest scrollable container (Hex uses a custom scroll div)
         scroll_info = await page.evaluate("""
@@ -580,11 +695,25 @@ async def _screenshot_one(p, url: str, cookies: list) -> bytes:
         await browser.close()
 
 
-async def _screenshot_async(url: str, cookies: list) -> bytes:
+async def _screenshot_async(
+    url: str,
+    cookies: list,
+    *,
+    expected_name: Optional[str] = None,
+    expected_email: Optional[str] = None,
+    expected_manager_email: Optional[str] = None,
+) -> bytes:
     """Convenience wrapper: owns the Playwright instance for a single URL."""
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
-        return await _screenshot_one(p, url, cookies)
+        return await _screenshot_one(
+            p,
+            url,
+            cookies,
+            expected_name=expected_name,
+            expected_email=expected_email,
+            expected_manager_email=expected_manager_email,
+        )
 
 
 async def _screenshot_all_async(leaders: list[dict], cookies: list) -> dict:
@@ -600,14 +729,29 @@ async def _screenshot_all_async(leaders: list[dict], cookies: list) -> dict:
             name = leader["name"]
             log.info("Generating report for %s …", name)
             try:
-                results[name] = await _screenshot_one(p, leader["hex_url"], cookies)
+                results[name] = await _screenshot_one(
+                    p,
+                    leader["hex_url"],
+                    cookies,
+                    expected_name=name,
+                    expected_email=leader.get("email", ""),
+                    expected_manager_email=leader.get("hex_manager_email", ""),
+                )
             except Exception as exc:
                 log.error("Failed to screenshot for %s: %s", name, exc)
                 results[name] = exc
     return results
 
 
-def screenshot_hex_url(url: str, port: int = CHROME_DEBUG_PORT, cookies: Optional[list] = None) -> bytes:
+def screenshot_hex_url(
+    url: str,
+    port: int = CHROME_DEBUG_PORT,
+    cookies: Optional[list] = None,
+    *,
+    expected_name: Optional[str] = None,
+    expected_email: Optional[str] = None,
+    expected_manager_email: Optional[str] = None,
+) -> bytes:
     """
     Screenshot *url* in a headless browser using session cookies from Chrome.
 
@@ -621,7 +765,15 @@ def screenshot_hex_url(url: str, port: int = CHROME_DEBUG_PORT, cookies: Optiona
     try:
         if cookies is None:
             cookies = extract_cookies(port)
-        return asyncio.run(_screenshot_async(url, cookies))
+        return asyncio.run(
+            _screenshot_async(
+                url,
+                cookies,
+                expected_name=expected_name,
+                expected_email=expected_email,
+                expected_manager_email=expected_manager_email,
+            )
+        )
     except Exception as exc:
         if "connect" in str(exc).lower() or "ECONNREFUSED" in str(exc):
             raise ConnectionError(
